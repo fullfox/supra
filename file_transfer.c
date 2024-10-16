@@ -40,7 +40,7 @@ sender - receiver
 
 typedef enum {
     INIT,
-    DATA,
+    FILE_CHUNK,
     CHECK,
     NACK
 } PacketType;
@@ -69,11 +69,14 @@ typedef struct {
 } NACKPacket;
 
 
-
-
 // Sender implementation
 void sender_run(const char *file_path, int argc, char *argv[]) {
     volatile int periodic_sender_state = 0;
+
+    NetStats netStats;
+    netStats.total_bytes_transfered = 0;
+    netStats.delta_bytes_transfered = 0;
+    netStats.t1 = 0;
 
     struct sockaddr_in local_addr;
     int sockfd = create_and_bind_udp_socket(&local_addr);
@@ -86,7 +89,7 @@ void sender_run(const char *file_path, int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    int frame_size = UDP_PAYLOAD_SIZE - sizeof(PacketHeader);
+    int frame_size = atoi(argv[0]) - sizeof(PacketHeader);
 
     // Open the file
     FILE *fp = fopen(file_path, "rb");
@@ -99,6 +102,7 @@ void sender_run(const char *file_path, int argc, char *argv[]) {
     uint64_t file_size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     printf("File size:%lu\n", file_size);
+    netStats.file_size = file_size;
 
 
     // Send file metadata
@@ -120,16 +124,19 @@ void sender_run(const char *file_path, int argc, char *argv[]) {
         }
     }
 
+    // Start network stats routine
+    pthread_t netstats_thread;
+    pthread_create(&netstats_thread, NULL, netstats_routine, &netStats);
+    pthread_detach(netstats_thread);
 
     // Send file data
     uint32_t seq_num = 0;
     size_t bytes_read;
     uint8_t *buffer = malloc(frame_size + sizeof(PacketHeader));
-    while ((bytes_read = transmit_file_chunk(sockfd, &dest_addr, dest_addr_len, fp, seq_num, frame_size, buffer)) == 0) {
+    while ((bytes_read = send_file_chunk(sockfd, &dest_addr, dest_addr_len, fp, seq_num, frame_size, buffer, &netStats)) == 0) {
         seq_num++;
-        usleep(1);
     }
-    free(buffer);
+    
 
 
     // Send checks, receive nacks, and retransmit
@@ -146,13 +153,24 @@ void sender_run(const char *file_path, int argc, char *argv[]) {
             if (bytes_received > 0) {
                 if (nackPacket.type == NACK) {
                     periodic_sender_state = 0;
-                    complete = parse_nack_and_retransmit(sockfd, &dest_addr, dest_addr_len, fp, (uint8_t*) &nackPacket, frame_size);
+                    if (nackPacket.count == 0) {
+                        complete = 1;
+                    }
+
+                    for (uint32_t i = 0; i < nackPacket.count; i++) {
+                        uint32_t seq_num = nackPacket.missing[i];
+                        if (send_file_chunk(sockfd, &dest_addr, dest_addr_len, fp, seq_num, frame_size, buffer, &netStats) < 0) {
+                            fprintf(stderr, "Failed to retransmit packet %u\n", seq_num);
+                        }
+                    }
                     break;
                 }
             }
         }
     }
 
+    pthread_cancel(netstats_thread);
+    free(buffer);
     fclose(fp);
     close(sockfd);
 }
@@ -161,6 +179,11 @@ void sender_run(const char *file_path, int argc, char *argv[]) {
 
 // Receiver implementation
 void receiver_run(int argc, char *argv[]) {
+
+    NetStats netStats;
+    netStats.total_bytes_transfered = 0;
+    netStats.delta_bytes_transfered = 0;
+    netStats.t1 = 0;
 
     struct sockaddr_in local_addr;
     int sockfd = create_and_bind_udp_socket(&local_addr);
@@ -182,7 +205,7 @@ void receiver_run(int argc, char *argv[]) {
     }
     
     uint64_t file_size = initPacket.file_size;
-    uint64_t received_size = 0;
+    netStats.file_size = file_size;
     uint32_t frame_size = initPacket.frame_size;
     printf("Receiving file size: %lu, frame size: %u\n", file_size, frame_size);
 
@@ -218,9 +241,12 @@ void receiver_run(int argc, char *argv[]) {
     volatile int periodic_sender_state = 1;
     periodic_sender(sockfd, (struct sockaddr*) &sender_addr, sizeof(sender_addr), (uint8_t*) &initAckPacket, sizeof(initAckPacket), &periodic_sender_state);
 
-    int tick = 0;
-    uint64_t t1 = get_timestamp_millis();
-    uint64_t last_received = 0;
+
+    // Start network stats routine
+    pthread_t netstats_thread;
+    pthread_create(&netstats_thread, NULL, netstats_routine, &netStats);
+    pthread_detach(netstats_thread);
+
     while (1) {
         ssize_t n = recvfrom(sockfd, buffer, frame_size+sizeof(PacketHeader), 0, NULL, NULL);
         if (n < sizeof(Packet)) {
@@ -230,7 +256,7 @@ void receiver_run(int argc, char *argv[]) {
 
         Packet * packet = (Packet *) buffer;
 
-        if(packet->type == DATA && n >= sizeof(PacketHeader)){
+        if(packet->type == FILE_CHUNK && n >= sizeof(PacketHeader)){
             periodic_sender_state = 0;
             PacketHeader *header = (PacketHeader *) buffer;
 
@@ -248,26 +274,7 @@ void receiver_run(int argc, char *argv[]) {
 
             // Process only if the packet hasn't been received yet
             if (!received_packets[header->seq_num]) {
-                received_size+= header->data_len;
-                tick++;
-
-                if (tick>10000){
-                    // PRINT DEBUG
-                    uint64_t t2 = get_timestamp_millis();
-                    uint64_t delta_t = t2 - t1;
-                    t1 = t2;
-
-                    uint64_t delta_bytes = received_size - last_received;
-                    last_received = received_size;
-
-                    uint64_t bitrate = 1000*delta_bytes/delta_t;
-
-                    char unit[3];
-                    double conv_bitrate = format_size_with_unit(bitrate, unit);
-
-                    tick = 0;
-                    printf("received %.2f, bitrate %.1f %s/s\n", (double)100*received_size/ (double)file_size, conv_bitrate, unit);
-                }
+                netStats.delta_bytes_transfered += header->data_len;
                 
                 uint64_t offset = (uint64_t)header->seq_num * frame_size;
 
@@ -299,6 +306,7 @@ void receiver_run(int argc, char *argv[]) {
         }
     }
 
+    pthread_cancel(netstats_thread);
     free(buffer);
     free(received_packets);
     fclose(fp);
@@ -322,27 +330,9 @@ void send_nack(int sockfd, struct sockaddr_in *sender_addr, uint32_t *missing_pa
     }
 }
 
-int parse_nack_and_retransmit(int sockfd, struct sockaddr_in *dest_addr, socklen_t dest_addr_len, FILE *fp, uint8_t * packet, size_t frame_size) {
-    NACKPacket * nackPacket = (NACKPacket *) packet;
-    if (nackPacket->count == 0) {
-        return 1;
-    }
-
-    uint8_t *buffer = malloc(frame_size + sizeof(PacketHeader));
-    for (uint32_t i = 0; i < nackPacket->count; i++) {
-        uint32_t seq_num = nackPacket->missing[i];
-        if (transmit_file_chunk(sockfd, dest_addr, dest_addr_len, fp, seq_num, frame_size, buffer) < 0) {
-            fprintf(stderr, "Failed to retransmit packet %u\n", seq_num);
-        }
-    }
-    free(buffer);
-
-    return 0;
-}
-
-int transmit_file_chunk(int sockfd, struct sockaddr_in *dest_addr, socklen_t dest_addr_len, FILE *fp, uint32_t seq_num, size_t frame_size, uint8_t * buffer) {
+int send_file_chunk(int sockfd, struct sockaddr_in *dest_addr, socklen_t dest_addr_len, FILE *fp, uint32_t seq_num, size_t frame_size, uint8_t * buffer, NetStats* netStats) {
     PacketHeader *header = (PacketHeader *)buffer;
-    header->type = DATA;
+    header->type = FILE_CHUNK;
     header->seq_num = seq_num;
 
     fseek(fp, (uint64_t)seq_num * frame_size, SEEK_SET);
@@ -352,6 +342,7 @@ int transmit_file_chunk(int sockfd, struct sockaddr_in *dest_addr, socklen_t des
         header->data_len = bytes_read;
         size_t total_size = sizeof(PacketHeader) + bytes_read;
         sendto(sockfd, buffer, total_size, 0, (struct sockaddr*) dest_addr, dest_addr_len);
+        netStats->delta_bytes_transfered+=total_size;
     }
 
     return (bytes_read > 0) ? 0 : -1;
