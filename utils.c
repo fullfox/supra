@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #include "utils.h"
 
@@ -63,4 +64,23 @@ void *netstats_routine(void *arg) {
     }
   
     return NULL;
+}
+
+
+void delay_microseconds(long delay_us) {
+    struct timespec start, current;
+    
+    // Get the current time
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    
+    long elapsed_us = 0;
+    
+    while (elapsed_us < delay_us) {
+        // Get the current time again
+        clock_gettime(CLOCK_MONOTONIC, &current);
+        
+        // Calculate the elapsed time in microseconds
+        elapsed_us = (current.tv_sec - start.tv_sec) * 1000000L 
+                     + (current.tv_nsec - start.tv_nsec) / 1000L;
+    }
 }

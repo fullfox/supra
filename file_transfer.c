@@ -1,6 +1,7 @@
 // file_transfer.c
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -12,6 +13,7 @@
 #include "file_transfer.h"
 #include "network.h"
 #include "utils.h"
+
 
 #define UDP_PAYLOAD_SIZE 1400 // Optimized. Max UDP payload size (65,507 bytes)
 #define MAX_NACK 350 // 4 byte per seq, NACKPacket about 1408 bytes
@@ -89,7 +91,8 @@ void sender_run(const char *file_path, int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    int frame_size = atoi(argv[0]) - sizeof(PacketHeader);
+    int frame_size = 1420 - sizeof(PacketHeader);
+    long sleep_delay = atoi(argv[0]);
 
     // Open the file
     FILE *fp = fopen(file_path, "rb");
@@ -135,6 +138,7 @@ void sender_run(const char *file_path, int argc, char *argv[]) {
     uint8_t *buffer = malloc(frame_size + sizeof(PacketHeader));
     while ((bytes_read = send_file_chunk(sockfd, &dest_addr, dest_addr_len, fp, seq_num, frame_size, buffer, &netStats)) == 0) {
         seq_num++;
+        if(sleep_delay>0) delay_microseconds(sleep_delay);
     }
     
 
@@ -163,6 +167,7 @@ void sender_run(const char *file_path, int argc, char *argv[]) {
                             fprintf(stderr, "Failed to retransmit packet %u\n", seq_num);
                         }
                     }
+
                     break;
                 }
             }
@@ -223,6 +228,7 @@ void receiver_run(int argc, char *argv[]) {
     fflush(fp);
 
     // Initialize tracking variables
+    uint32_t last_nack_index = 0;
     uint64_t total_packets = (file_size + frame_size - 1) / frame_size;
     uint8_t *received_packets = calloc(total_packets, sizeof(uint8_t));
     if (!received_packets) {
@@ -247,7 +253,8 @@ void receiver_run(int argc, char *argv[]) {
     pthread_create(&netstats_thread, NULL, netstats_routine, &netStats);
     pthread_detach(netstats_thread);
 
-    while (1) {
+    int complete = 0;
+    while (!complete) {
         ssize_t n = recvfrom(sockfd, buffer, frame_size+sizeof(PacketHeader), 0, NULL, NULL);
         if (n < sizeof(Packet)) {
             fprintf(stderr, "Received an incomplete packet\n");
@@ -286,26 +293,40 @@ void receiver_run(int argc, char *argv[]) {
                 received_packets[header->seq_num] = 1;
             }
 
-        } else if(packet->type == CHECK) { // SEND NACK todo more than 1000
-            uint32_t missing_packets[MAX_NACK];
-            uint32_t missing_count = 0;
+        } else if(packet->type == CHECK) { // SEND NACK
+            
+             uint32_t requested_total = 0;
+            uint32_t stop_nack_index = (last_nack_index+total_packets-1)%total_packets;
+            for (size_t j = 0; j < 10; j++) { //todo optimize 10
+                uint32_t missing_count = 0;
+                uint32_t missing_packets[MAX_NACK];
+                for (uint32_t i = last_nack_index; i < total_packets+last_nack_index; i++) {
+                    if (!received_packets[i%total_packets]) {
+                        missing_packets[missing_count++] = i%total_packets;
 
-            for (uint32_t i = 0; i < total_packets; i++) {
-                if (!received_packets[i]) {
-                    missing_packets[missing_count++] = i;
-                    if (missing_count == MAX_NACK) break;
+                        if (missing_count == MAX_NACK || i == stop_nack_index) {
+                            last_nack_index = (i+1)%total_packets;
+                            break;
+                        }
+                    }
+                }
+
+                if (missing_count == 0) {
+                    complete = 1;
+                    break;
+                }
+
+                requested_total+=missing_count;
+                send_nack(sockfd, &sender_addr, missing_packets, missing_count);
+                if(stop_nack_index+1 == last_nack_index){
+                    break;
                 }
             }
-
-            printf("Check received, missing %i\n", missing_count);
-            send_nack(sockfd, &sender_addr, missing_packets, missing_count);
-            if (missing_count == 0) {
-                printf("File transfer complete!\n");
-                break;
-            }
+            printf("Requested %i missing packet.\n",requested_total);
         }
     }
 
+    printf("File transfer complete!\n");
     pthread_cancel(netstats_thread);
     free(buffer);
     free(received_packets);
