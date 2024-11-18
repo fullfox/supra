@@ -11,7 +11,6 @@ void print_usage(const char *prog_name) {
     printf("  %s send <file_path> [options]\n", prog_name);
     printf("  %s receive [options]\n", prog_name);
     printf("\nOptions:\n");
-    printf("  --packet-size <size>    Specify packet size (default: max UDP size)\n");
     printf("  --dest-ip <ip>          Destination IP address\n");
     printf("  --dest-port <port>      Destination port\n");
     printf("  --help                  Display this help message\n");

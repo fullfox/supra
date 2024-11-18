@@ -7,7 +7,9 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 #include "utils.h"
+#include "packets.h"
 
 void perror_exit(const char *message) {
     perror(message);
@@ -42,28 +44,6 @@ double format_size_with_unit(uint64_t bytes, char *unit) {
         strcpy(unit, "B");
     }
     return value;
-}
-
-void *netstats_routine(void *arg) {
-    NetStats * netStats = (NetStats *) arg;
-
-    while(1){
-        netStats->total_bytes_transfered += netStats->delta_bytes_transfered;
-        uint64_t t2 = get_timestamp_millis();
-        uint64_t delta_t = t2 - netStats->t1;
-        uint64_t bitrate = 1000*netStats->delta_bytes_transfered/delta_t;
-        char unit[3];
-        double conv_bitrate = format_size_with_unit(bitrate, unit);
-
-        double percentage = (double) netStats->total_bytes_transfered / (double) netStats->file_size;
-
-        printf("sent/received: %.2f | bitrate: %.1f %s/s\n", percentage, conv_bitrate, unit);
-        netStats->t1 = t2;
-        netStats->delta_bytes_transfered = 0;
-        sleep(1);
-    }
-  
-    return NULL;
 }
 
 

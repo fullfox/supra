@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include "network.h"
 #include "utils.h"
+#include "packets.h"
 
 #define PUNCH_ATTEMPT_MSG "ping"
 #define PUNCH_OK_MSG "pong"
@@ -75,11 +76,13 @@ void get_destination(struct sockaddr_in *dest_addr, int argc, char *argv[]) {
 
 #define MAX_ATTEMPTS 10
 
+
 typedef struct {
     int sockfd;
     struct sockaddr_in dest_addr;
     volatile int state; // Shared state: 0 (pending), 1 (success), -1 (timeout)
 } udp_punch_context_t;
+
 
 void* udp_hole_punch_listen_thread(void* arg) {
     udp_punch_context_t* pstate = (udp_punch_context_t*)arg;
@@ -107,6 +110,7 @@ void* udp_hole_punch_listen_thread(void* arg) {
     }
     return NULL;
 }
+
 
 int udp_hole_punch(int sockfd, struct sockaddr_in *dest_addr) {
     udp_punch_context_t pstate = {sockfd, *dest_addr, 0};
@@ -140,19 +144,9 @@ int udp_hole_punch(int sockfd, struct sockaddr_in *dest_addr) {
 }
 
 
-
-typedef struct {
-    int sockfd;
-    struct sockaddr *addr;
-    socklen_t addr_len;
-    uint8_t * data;
-    int datalen;
-    volatile int *state;
-} periodic_sender_context_t;
-
 void *periodic_sender_routine(void *arg) {
     periodic_sender_context_t *data = (periodic_sender_context_t *)arg;
-    while (*(data->state)) {
+    while (1) {
         sendto(data->sockfd, data->data, data->datalen, 0,
                data->addr, data->addr_len);
         sleep(1);  // Send every 1 second
@@ -161,15 +155,54 @@ void *periodic_sender_routine(void *arg) {
     return NULL;
 }
 
-void periodic_sender(int sockfd, struct sockaddr *addr, socklen_t addr_len, uint8_t* data, int datalen, volatile int *state) {
-    pthread_t thread;
-    periodic_sender_context_t *sender_data = (periodic_sender_context_t *)malloc(sizeof(periodic_sender_context_t));
-    sender_data->sockfd = sockfd;
-    sender_data->addr = addr;
-    sender_data->addr_len = addr_len;
-    sender_data->data = data;
-    sender_data->datalen = datalen;
-    sender_data->state = state;
-    pthread_create(&thread, NULL, periodic_sender_routine, sender_data);
-    pthread_detach(thread);  // Detach to run the thread independently
+void *netstats_routine(void *arg) {
+    NetStats * netStats = (NetStats *) arg;
+
+    int i = 0;
+    while(1){
+        i++;
+        netStats->total_bytes_transfered += netStats->delta_bytes_transfered;
+        uint64_t t2 = get_timestamp_millis();
+        uint64_t delta_t = t2 - netStats->t1;
+        netStats->current_bitrate = 1000*netStats->delta_bytes_transfered/delta_t;
+        char unit[3];
+        double conv_bitrate = format_size_with_unit(netStats->current_bitrate, unit);
+
+        double percentage = (double) netStats->total_bytes_transfered / (double) netStats->file_size;
+        
+        // print only once a second
+        if( i%10 == 0 ){
+            if(netStats->role == SENDER) {
+                printf("sent: %.2f | bitrate: %.1f %s/s | sleep_delay %ld\n", percentage, conv_bitrate, unit, netStats->sleep_delay);
+            } else if (netStats->role == RECEIVER){
+                printf("received: %.2f | bitrate: %.1f %s/s\n", percentage, conv_bitrate, unit);
+            }
+        }
+        
+        netStats->t1 = t2;
+        netStats->delta_bytes_transfered = 0;
+        usleep(100000); // sleep 0.1s
+    }
+    return NULL;
+}
+
+void *slowdown_routine(void *arg) {
+    NetStats * netStats = (NetStats *) arg;
+    while(1) {
+        // receive slowdown packet
+        uint8_t buffer[1024];
+        ssize_t bytes_received = recvfrom(netStats->sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&netStats->dest_addr, &netStats->dest_addr_len);
+        if (bytes_received > 0) {
+            SlowdownPacket *slowdownPacket = (SlowdownPacket *) buffer;
+
+            float threshold = 0.95;
+            float factor = 1.1;
+            if(slowdownPacket->bitrate < threshold*netStats->current_bitrate){
+                netStats->sleep_delay *= factor;
+            } else if (slowdownPacket->bitrate > threshold*netStats->current_bitrate){
+                netStats->sleep_delay /= factor;
+            }
+        }
+    }
+    return NULL;
 }

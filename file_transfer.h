@@ -6,6 +6,7 @@
 #include <netinet/in.h>
 #include <stdio.h>
 #include "utils.h"
+#include "network.h"
 
 // Sender functions
 void sender_run(const char *file_path, int argc, char *argv[]);
